@@ -108,52 +108,43 @@ def get_kbo_stats(category: str = Query("hitter")):
         return handle_error(e, f"KBO-{category}")
 
 
-# 🌟 새로 추가된 KBO 일정 크롤링 엔드포인트
 @app.get("/api/kbo/schedule")
 def get_kbo_schedule():
-    """KBO 공식 홈페이지 이번 달 경기 일정 크롤링"""
+    """KBO 공식 홈페이지 전체 일정 데이터 추출 (개선된 방식)"""
     url = "https://www.koreabaseball.com/Schedule/Schedule.aspx"
 
     try:
-        html_content = ""
+        data_list = []
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-            )
-            page = context.new_page()
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle", timeout=20000)
 
-            page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            page.wait_for_selector("table", timeout=10000)
-            html_content = page.content()
+            # 페이지 내 모든 tr 요소를 찾아서 파싱
+            rows = page.query_selector_all("#tblScheduleList tbody tr")
+
+            current_date = ""
+            for row in rows:
+                cols = row.query_selector_all("td")
+                if len(cols) < 5: continue
+
+                # 날짜 열이 병합되어 있을 수 있으므로 텍스트가 있으면 갱신
+                date_text = cols[0].inner_text().strip()
+                if date_text: current_date = date_text
+
+                game_data = {
+                    "date": current_date,
+                    "time": cols[1].inner_text().strip(),
+                    "game": cols[2].inner_text().strip(),
+                    "broadcast": cols[3].inner_text().strip(),
+                    "stadium": cols[4].inner_text().strip(),
+                    "note": cols[5].inner_text().strip() if len(cols) > 5 else ""
+                }
+                data_list.append(game_data)
+
             browser.close()
 
-        tables = pd.read_html(io.StringIO(html_content))
-        if not tables:
-            raise ValueError("일정 표를 찾을 수 없습니다.")
-
-        df = tables[0]
-
-        # 셀 병합(Rowspan)으로 인해 발생한 빈 날짜 채우기 (ffill)
-        if "날짜" in df.columns:
-            df["날짜"] = df["날짜"].ffill()
-
-        df = df.fillna("")
-
-        col_mapping = {
-            "날짜": "date",
-            "시간": "time",
-            "경기": "game",
-            "중계방송": "broadcast",
-            "구장": "stadium",
-            "비고": "note"
-        }
-        df = df.rename(columns=col_mapping)
-
-        return {"status": "success", "data": df.to_dict(orient="records")}
+        return {"status": "success", "data": data_list}
 
     except Exception as e:
         return handle_error(e, "KBO-Schedule")
