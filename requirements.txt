@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pandas
+playwright
+lxml
+html5lib
