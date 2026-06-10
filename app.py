@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright
 app = FastAPI(
     title="Sports Stats Scraper API",
     description="KBO(타자/투수/수비/주루 세부스탯 및 일정), NPB, Soccer, Basketball 스크래핑 API",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 app.add_middleware(
@@ -24,23 +24,25 @@ app.add_middleware(
 def fetch_and_parse_table(url: str, column_mapping: dict) -> pd.DataFrame:
     html_content = ""
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        browser = p.chromium.launch(headless=True,
+                                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0")
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0")
         page = context.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            # 🌟 데이터 셀이 하나라도 나타날 때까지 기다림 (해외 지연 방어)
-            page.wait_for_selector("table tbody tr td", timeout=15000)
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            # 🌟 핵심 방어: '팀명'이라는 글자가 포함된 진짜 기록 테이블이 나타날 때까지 대기
+            page.wait_for_selector("table:has-text('팀명')", timeout=20000)
             html_content = page.content()
         except Exception as e:
-            raise Exception(f"페이지 로딩 실패: {str(e)}")
+            raise Exception(f"페이지 로딩 또는 테이블 대기 실패: {str(e)}")
         finally:
             browser.close()
 
-    tables = pd.read_html(io.StringIO(html_content))
+    # 🌟 핵심 방어: 상단 미니 전광판을 무시하고 '팀명' 컬럼이 있는 테이블만 골라서 파싱
+    tables = pd.read_html(io.StringIO(html_content), match="팀명")
     if not tables:
-        raise ValueError("테이블을 찾을 수 없습니다.")
+        raise ValueError("진짜 팀 기록 테이블을 찾을 수 없습니다.")
     return tables[0].fillna(0).rename(columns=column_mapping)
 
 
@@ -53,7 +55,6 @@ def handle_error(e: Exception, sport_name: str):
 def get_kbo_stats(category: str = Query("hitter")):
     category = category.lower()
 
-    # 설정값 구성
     configs = {
         "hitter": (["https://www.koreabaseball.com/Record/Team/Hitter/Basic1.aspx",
                     "https://www.koreabaseball.com/Record/Team/Hitter/Basic2.aspx"],
@@ -88,34 +89,47 @@ def get_kbo_stats(category: str = Query("hitter")):
 
 @app.get("/api/kbo/schedule")
 def get_kbo_schedule():
-    """KBO 일정 크롤링 (데이터 대기 로직 강화)"""
+    """KBO 일정 크롤링 (상단 미니 오인 방지 완벽 보강)"""
     url = "https://www.koreabaseball.com/Schedule/Schedule.aspx"
     try:
-        data_list = []
+        html_content = ""
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            # 🌟 일정표 내용이 뜰 때까지 대기
-            page.wait_for_selector("#tblScheduleList tbody tr td", timeout=15000)
+            browser = p.chromium.launch(headless=True,
+                                        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0")
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                # 🌟 핵심 방어: 미니 전광판엔 없고 본문 일정표에만 있는 '구장' 텍스트 테이블 대기
+                page.wait_for_selector("table:has-text('구장')", timeout=20000)
+                html_content = page.content()
+            except Exception as e:
+                raise Exception(f"일정 페이지 로딩 실패: {str(e)}")
+            finally:
+                browser.close()
 
-            rows = page.query_selector_all("#tblScheduleList tbody tr")
-            current_date = ""
-            for row in rows:
-                cols = row.query_selector_all("td")
-                if len(cols) < 5: continue
-                date_text = cols[0].inner_text().strip()
-                if date_text: current_date = date_text
-                data_list.append({
-                    "date": current_date,
-                    "time": cols[1].inner_text().strip(),
-                    "game": cols[2].inner_text().strip(),
-                    "broadcast": cols[3].inner_text().strip(),
-                    "stadium": cols[4].inner_text().strip(),
-                    "note": cols[5].inner_text().strip() if len(cols) > 5 else ""
-                })
-            browser.close()
-        return {"status": "success", "data": data_list}
+        # 🌟 핵심 방어: '구장' 텍스트 컬럼이 포함된 진짜 이번 달 전체 일정 테이블만 정확히 타겟팅
+        tables = pd.read_html(io.StringIO(html_content), match="구장")
+        if not tables:
+            raise ValueError("일정 테이블을 찾을 수 없습니다.")
+
+        df = tables[0]
+        if "날짜" in df.columns:
+            df["날짜"] = df["날짜"].ffill()  # 연속 날짜 셀 병합 채우기
+
+        df = df.fillna("")
+
+        col_mapping = {
+            "날짜": "date",
+            "시간": "time",
+            "경기": "game",
+            "중계방송": "broadcast",
+            "구장": "stadium",
+            "비고": "note"
+        }
+        df = df.rename(columns=col_mapping)
+        return {"status": "success", "data": df.to_dict(orient="records")}
     except Exception as e:
         return handle_error(e, "KBO-Schedule")
 
