@@ -1,15 +1,15 @@
 import io
 import uvicorn
 import pandas as pd
+import urllib.request  # 🌟 Playwright 대신 사용할 초경량 파이썬 내장 라이브러리
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from playwright.sync_api import sync_playwright
 
 app = FastAPI(
     title="Sports Stats Scraper API",
-    description="KBO(타자/투수/수비/주루 세부스탯 및 일정), NPB, Soccer, Basketball 스크래핑 API",
-    version="2.4.0"
+    description="KBO(타자/투수/수비/주루 세부스탯 및 일정) 초경량 스크래핑 API",
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -21,29 +21,27 @@ app.add_middleware(
 )
 
 
-def fetch_and_parse_table(url: str, column_mapping: dict) -> pd.DataFrame:
-    html_content = ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True,
-                                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0")
-        page = context.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            # 🌟 핵심 방어: '팀명'이라는 글자가 포함된 진짜 기록 테이블이 나타날 때까지 대기
-            page.wait_for_selector("table:has-text('팀명')", timeout=20000)
-            html_content = page.content()
-        except Exception as e:
-            raise Exception(f"페이지 로딩 또는 테이블 대기 실패: {str(e)}")
-        finally:
-            browser.close()
+def fetch_and_parse_table(url: str, column_mapping: dict, match_text: str) -> pd.DataFrame:
+    """Playwright 없이 브라우저 헤더만 모방하여 초고속으로 HTML을 다운로드하고 파싱합니다."""
+    try:
+        # 브라우저인 것처럼 속이는 헤더 설정
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+        )
+        # 메모리를 거의 먹지 않는 초경량 HTTP 요청 (타임아웃 15초)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            html_content = response.read().decode('utf-8')
 
-    # 🌟 핵심 방어: 상단 미니 전광판을 무시하고 '팀명' 컬럼이 있는 테이블만 골라서 파싱
-    tables = pd.read_html(io.StringIO(html_content), match="팀명")
-    if not tables:
-        raise ValueError("진짜 팀 기록 테이블을 찾을 수 없습니다.")
-    return tables[0].fillna(0).rename(columns=column_mapping)
+        # 지정한 텍스트(예: '팀명')가 있는 진짜 테이블만 저격 파싱
+        tables = pd.read_html(io.StringIO(html_content), match=match_text)
+        if not tables:
+            raise ValueError(f"'{match_text}' 테이블을 찾을 수 없습니다.")
+
+        return tables[0].fillna(0).rename(columns=column_mapping)
+    except Exception as e:
+        raise Exception(f"데이터 다운로드 및 파싱 실패: {str(e)}")
 
 
 def handle_error(e: Exception, sport_name: str):
@@ -77,9 +75,9 @@ def get_kbo_stats(category: str = Query("hitter")):
 
     try:
         urls, m1, m2 = configs[category]
-        df1 = fetch_and_parse_table(urls[0], m1)
+        df1 = fetch_and_parse_table(urls[0], m1, "팀명")
         if m2:
-            df2 = fetch_and_parse_table(urls[1], m2)
+            df2 = fetch_and_parse_table(urls[1], m2, "팀명")
             if "rank" in df2.columns: df2 = df2.drop(columns=["rank"])
             df1 = pd.merge(df1, df2, on="team", how="inner")
         return {"status": "success", "data": df1.to_dict(orient="records")}
@@ -89,34 +87,25 @@ def get_kbo_stats(category: str = Query("hitter")):
 
 @app.get("/api/kbo/schedule")
 def get_kbo_schedule():
-    """KBO 일정 크롤링 (상단 미니 오인 방지 완벽 보강)"""
+    """KBO 일정 크롤링 (초경량 및 상단 미니 전광판 오인 방지 완벽 반영)"""
     url = "https://www.koreabaseball.com/Schedule/Schedule.aspx"
     try:
-        html_content = ""
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True,
-                                        args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0")
-            page = context.new_page()
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                # 🌟 핵심 방어: 미니 전광판엔 없고 본문 일정표에만 있는 '구장' 텍스트 테이블 대기
-                page.wait_for_selector("table:has-text('구장')", timeout=20000)
-                html_content = page.content()
-            except Exception as e:
-                raise Exception(f"일정 페이지 로딩 실패: {str(e)}")
-            finally:
-                browser.close()
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            html_content = response.read().decode('utf-8')
 
-        # 🌟 핵심 방어: '구장' 텍스트 컬럼이 포함된 진짜 이번 달 전체 일정 테이블만 정확히 타겟팅
+        # '구장'이라는 텍스트가 포함된 진짜 한 달 일정 테이블만 선택
         tables = pd.read_html(io.StringIO(html_content), match="구장")
         if not tables:
             raise ValueError("일정 테이블을 찾을 수 없습니다.")
 
         df = tables[0]
         if "날짜" in df.columns:
-            df["날짜"] = df["날짜"].ffill()  # 연속 날짜 셀 병합 채우기
+            df["날짜"] = df["날짜"].ffill()
 
         df = df.fillna("")
 
