@@ -1,4 +1,6 @@
 import io
+import os
+import time
 import requests
 import uvicorn
 import pandas as pd
@@ -25,6 +27,73 @@ app.add_middleware(
 def handle_error(e: Exception, sport_name: str):
     print(f"[{sport_name} API Error] {str(e)}")
     return JSONResponse(status_code=500, content={"status": "error", "message": str(e), "data": []})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# API-Football (Pro) — 2026 월드컵 일정/세부지표의 1순위 소스.
+# 키는 환경변수 API_FOOTBALL_KEY 로만 주입(클라이언트 노출 금지). 미설정/오류 시 FIFA 폴백.
+# ──────────────────────────────────────────────────────────────────────────
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
+API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+WORLDCUP_AF = {"league": 1, "season": 2026}  # league 1 = FIFA World Cup
+
+# 아주 단순한 인메모리 TTL 캐시(인스턴스 단위). 비싼 집계/라이브 호출 재요청 방지.
+_AF_CACHE: dict[str, tuple[float, object]] = {}
+
+
+def _cache_get(key: str, ttl: float):
+    hit = _AF_CACHE.get(key)
+    if hit and (time.time() - hit[0] < ttl):
+        return hit[1]
+    return None
+
+
+def _cache_set(key: str, value):
+    _AF_CACHE[key] = (time.time(), value)
+    return value
+
+
+def af_get(path: str, params: dict | None = None, timeout: int = 20) -> dict:
+    """API-Football GET. 키 미설정/HTTP 오류/응답 errors 가 있으면 예외를 던져 폴백을 유도한다."""
+    if not API_FOOTBALL_KEY:
+        raise RuntimeError("API_FOOTBALL_KEY 미설정")
+    resp = requests.get(
+        f"{API_FOOTBALL_BASE}{path}",
+        params=params or {},
+        headers={"x-apisports-key": API_FOOTBALL_KEY, "Accept": "application/json"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    errors = payload.get("errors")
+    # API-Football 은 errors 를 {} 또는 [] 로 주며, 비어있지 않으면 실패(쿼터/파라미터 등)
+    if errors and (isinstance(errors, dict) and errors or isinstance(errors, list) and errors):
+        raise RuntimeError(f"API-Football errors: {errors}")
+    return payload
+
+
+def _af_stat_value(stat_items: list, *names):
+    """fixtures/statistics 의 [{type,value}] 목록에서 주어진 type 이름들 중 첫 매칭 값을 반환."""
+    wanted = {n.lower() for n in names}
+    for item in stat_items or []:
+        if str(item.get("type", "")).lower() in wanted:
+            return item.get("value")
+    return None
+
+
+def _pct_to_number(val):
+    """'61%' → 61.0, 숫자면 그대로. None/'' → None."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, str) and val.endswith("%"):
+        try:
+            return float(val.rstrip("%"))
+        except ValueError:
+            return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
 
 
 @app.get("/api/kbo/all")
@@ -134,9 +203,39 @@ def get_kbo_schedule():
 WORLDCUP_2026 = {"competition": "17", "season": "285023"}
 
 
-@app.get("/api/worldcup/schedule")
-def get_worldcup_schedule():
-    """2026 FIFA 월드컵 경기 일정 (FIFA 공식 데이터 API v3 사용 - FIFA SPA가 내부적으로 쓰는 공식 소스라 가장 안정적)"""
+def _worldcup_schedule_af() -> list:
+    """[1순위] API-Football /fixtures 로 2026 월드컵 일정. 실패 시 예외(→ FIFA 폴백)."""
+    cached = _cache_get("wc_schedule", ttl=600)  # 10분 캐시
+    if cached is not None:
+        return cached
+
+    payload = af_get("/fixtures", {"league": WORLDCUP_AF["league"], "season": WORLDCUP_AF["season"]})
+    games = []
+    for it in payload.get("response", []) or []:
+        fx = it.get("fixture") or {}
+        lg = it.get("league") or {}
+        teams = it.get("teams") or {}
+        goals = it.get("goals") or {}
+        venue = fx.get("venue") or {}
+        st = fx.get("status") or {}
+        games.append({
+            "match_id": fx.get("id"),                 # 라이브 상세 패널에서 사용
+            "date": fx.get("date"),                   # UTC ISO
+            "home": (teams.get("home") or {}).get("name"),
+            "away": (teams.get("away") or {}).get("name"),
+            "group": "",                              # 그룹 문자는 standings에서만 → 빈 값
+            "stage": lg.get("round"),                 # 'Group Stage - 1' / 'Round of 16' ...
+            "stadium": venue.get("name"),
+            "city": venue.get("city"),
+            "status": st.get("short"),                # NS/1H/HT/2H/FT/AET ...
+            "home_score": goals.get("home"),
+            "away_score": goals.get("away"),
+        })
+    return _cache_set("wc_schedule", games)
+
+
+def _worldcup_schedule_fifa() -> list:
+    """[폴백] FIFA 공식 데이터 API. 실패 시 예외."""
     url = "https://api.fifa.com/api/v3/calendar/matches"
     params = {
         "idCompetition": WORLDCUP_2026["competition"],
@@ -144,135 +243,308 @@ def get_worldcup_schedule():
         "count": 500,
         "language": "en",
     }
-    # 봇 차단 회피용 브라우저 User-Agent
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0",
         "Accept": "application/json",
     }
+    resp = requests.get(url, params=params, headers=headers, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    results = payload.get("Results") or payload.get("results") or []
 
+    def localized(node):
+        try:
+            return node[0]["Description"]
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    def team_name(side):
+        try:
+            return side["TeamName"][0]["Description"]
+        except (KeyError, IndexError, TypeError):
+            return "미정"
+
+    games = []
+    for m in results:
+        home = m.get("Home") or {}
+        away = m.get("Away") or {}
+        stadium = m.get("Stadium") or {}
+        games.append({
+            "match_id": m.get("IdMatch"),
+            "date": m.get("Date"),
+            "home": team_name(home),
+            "away": team_name(away),
+            "group": localized(m.get("GroupName")),
+            "stage": localized(m.get("StageName")),
+            "stadium": localized(stadium.get("Name")),
+            "city": "",
+            "status": m.get("MatchStatus"),
+            "home_score": home.get("Score"),
+            "away_score": away.get("Score"),
+        })
+    return games
+
+
+@app.get("/api/worldcup/schedule")
+def get_worldcup_schedule():
+    """2026 월드컵 일정 — API-Football 1순위, 실패 시 FIFA 공식 API 폴백."""
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        return handle_error(e, "WorldCup-Fetch")
+        return {"status": "success", "source": "api-football", "data": _worldcup_schedule_af()}
+    except Exception as e_af:
+        print(f"[WorldCup-Schedule] API-Football 실패 → FIFA 폴백: {e_af}")
+        try:
+            return {"status": "success", "source": "fifa", "data": _worldcup_schedule_fifa()}
+        except Exception as e_fifa:
+            return handle_error(e_fifa, "WorldCup-Schedule")
 
+
+def _worldcup_teamstats_af() -> dict:
+    """[1순위] API-Football: standings(전적/득실) + fixtures/statistics 집계(점유율·유효슈팅·xG/xGA)."""
+    cached = _cache_get("wc_teamstats", ttl=3 * 3600)  # 3시간 캐시
+    if cached is not None:
+        return cached
+
+    # 1) 순위표 → 전적/득실
+    standings = af_get("/standings", {"league": WORLDCUP_AF["league"], "season": WORLDCUP_AF["season"]})
+    data: dict = {}
+    sresp = standings.get("response", []) or []
+    if sresp:
+        for group in ((sresp[0].get("league") or {}).get("standings") or []):
+            for row in group:
+                tname = (row.get("team") or {}).get("name")
+                if not tname:
+                    continue
+                allg = row.get("all") or {}
+                goals = allg.get("goals") or {}
+                played = allg.get("played") or 0
+                gf = goals.get("for") or 0
+                ga = goals.get("against") or 0
+                gp = played or 1
+                data[tname] = {
+                    "played": played,
+                    "w": allg.get("win") or 0,
+                    "d": allg.get("draw") or 0,
+                    "l": allg.get("lose") or 0,
+                    "gf": gf, "ga": ga,
+                    "avg_gf": round(gf / gp, 2),
+                    "avg_ga": round(ga / gp, 2),
+                    "points": row.get("points"),
+                    "group": row.get("group"),
+                    # 세부지표(아래 집계에서 채움; 데이터 없으면 None 유지)
+                    "avg_possession": None,
+                    "avg_shots_on_target": None,
+                    "avg_xg": None,
+                    "avg_xga": None,
+                }
+
+    # 2) 종료(FT) 경기들의 매치 통계 집계 → 팀별 평균 점유율/유효슈팅/xG/xGA
     try:
-        results = payload.get("Results") or payload.get("results") or []
+        fixtures = _worldcup_schedule_af()
+    except Exception:
+        fixtures = []
 
-        def localized(node):
-            # FIFA는 다국어 배열 형태([{Locale, Description}, ...])로 내려줌
-            try:
-                return node[0]["Description"]
-            except (KeyError, IndexError, TypeError):
-                return ""
-
-        def team_name(side):
-            try:
-                return side["TeamName"][0]["Description"]
-            except (KeyError, IndexError, TypeError):
-                return "미정"  # 토너먼트 등 대진 미확정 경기 방어
-
-        games = []
-        for m in results:
-            home = m.get("Home") or {}
-            away = m.get("Away") or {}
-            stadium = m.get("Stadium") or {}
-            games.append({
-                "date": m.get("Date"),                  # UTC ISO (예: 2026-06-11T19:00:00Z)
-                "home": team_name(home),
-                "away": team_name(away),
-                "group": localized(m.get("GroupName")),  # 예: Group A (없으면 빈 문자열)
-                "stage": localized(m.get("StageName")),  # 예: First Stage / Round of 32 ...
-                "stadium": localized(stadium.get("Name")),
-                "status": m.get("MatchStatus"),
-                "home_score": home.get("Score"),
-                "away_score": away.get("Score"),
+    agg: dict = {}  # name -> 누적 {합계, 개수}
+    for g in fixtures:
+        if g.get("status") != "FT" or not g.get("match_id"):
+            continue
+        try:
+            stat_payload = af_get("/fixtures/statistics", {"fixture": g["match_id"]})
+        except Exception:
+            continue
+        sides = stat_payload.get("response", []) or []
+        if len(sides) < 2:
+            continue
+        parsed = []
+        for side in sides:
+            items = side.get("statistics") or []
+            parsed.append({
+                "name": (side.get("team") or {}).get("name"),
+                "pos": _pct_to_number(_af_stat_value(items, "Ball Possession")),
+                "sot": _pct_to_number(_af_stat_value(items, "Shots on Goal")),
+                "xg": _pct_to_number(_af_stat_value(items, "expected_goals")),
             })
+        for i, p in enumerate(parsed):
+            name = p["name"]
+            if not name:
+                continue
+            opp = parsed[1 - i]
+            a = agg.setdefault(name, {"pos": 0.0, "npos": 0, "sot": 0.0, "nsot": 0,
+                                      "xg": 0.0, "nxg": 0, "xga": 0.0, "nxga": 0})
+            if p["pos"] is not None:
+                a["pos"] += p["pos"]; a["npos"] += 1
+            if p["sot"] is not None:
+                a["sot"] += p["sot"]; a["nsot"] += 1
+            if p["xg"] is not None:
+                a["xg"] += p["xg"]; a["nxg"] += 1
+            if opp.get("xg") is not None:
+                a["xga"] += opp["xg"]; a["nxga"] += 1
 
-        return {"status": "success", "data": games}
-    except Exception as e:
-        return handle_error(e, "WorldCup-Parsing")
+    for name, a in agg.items():
+        d = data.get(name)
+        if not d:
+            continue
+        if a["npos"]:
+            d["avg_possession"] = round(a["pos"] / a["npos"], 1)
+        if a["nsot"]:
+            d["avg_shots_on_target"] = round(a["sot"] / a["nsot"], 2)
+        if a["nxg"]:
+            d["avg_xg"] = round(a["xg"] / a["nxg"], 2)
+        if a["nxga"]:
+            d["avg_xga"] = round(a["xga"] / a["nxga"], 2)
+
+    return _cache_set("wc_teamstats", data)
+
+
+def _worldcup_teamstats_fifa() -> dict:
+    """[폴백] FIFA 경기 결과로부터 전적/득실만 계산(세부지표 없음)."""
+    url = "https://api.fifa.com/api/v3/calendar/matches"
+    params = {
+        "idCompetition": WORLDCUP_2026["competition"],
+        "idSeason": WORLDCUP_2026["season"],
+        "count": 500,
+        "language": "en",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0",
+        "Accept": "application/json",
+    }
+    resp = requests.get(url, params=params, headers=headers, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    results = payload.get("Results") or payload.get("results") or []
+
+    def team_name(side):
+        try:
+            return side["TeamName"][0]["Description"]
+        except (KeyError, IndexError, TypeError):
+            return None
+
+    stats = {}
+
+    def slot(name):
+        if name not in stats:
+            stats[name] = {"played": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0}
+        return stats[name]
+
+    for m in results:
+        if m.get("MatchStatus") != 0:
+            continue
+        hn = team_name(m.get("Home") or {})
+        an = team_name(m.get("Away") or {})
+        hs, as_ = m.get("HomeTeamScore"), m.get("AwayTeamScore")
+        if not hn or not an or hs is None or as_ is None:
+            continue
+        try:
+            hs, as_ = int(hs), int(as_)
+        except (ValueError, TypeError):
+            continue
+        sh, sa = slot(hn), slot(an)
+        sh["played"] += 1; sa["played"] += 1
+        sh["gf"] += hs; sh["ga"] += as_
+        sa["gf"] += as_; sa["ga"] += hs
+        if hs > as_:
+            sh["w"] += 1; sa["l"] += 1
+        elif hs < as_:
+            sh["l"] += 1; sa["w"] += 1
+        else:
+            sh["d"] += 1; sa["d"] += 1
+
+    data = {}
+    for name, s in stats.items():
+        gp = s["played"] or 1
+        data[name] = {
+            "played": s["played"],
+            "w": s["w"], "d": s["d"], "l": s["l"],
+            "gf": s["gf"], "ga": s["ga"],
+            "avg_gf": round(s["gf"] / gp, 2),
+            "avg_ga": round(s["ga"] / gp, 2),
+            "points": s["w"] * 3 + s["d"],
+            "avg_possession": None, "avg_shots_on_target": None,
+            "avg_xg": None, "avg_xga": None,
+        }
+    return data
 
 
 @app.get("/api/worldcup/teamstats")
 def get_worldcup_teamstats():
-    """각 국가대표팀의 2026 월드컵 본선 성적 집계(전적·득실점).
-    FIFA 경기 결과(MatchStatus==0)로부터 직접 계산하므로 일정 엔드포인트와 팀명이 100% 동일."""
-    url = "https://api.fifa.com/api/v3/calendar/matches"
-    params = {
-        "idCompetition": WORLDCUP_2026["competition"],
-        "idSeason": WORLDCUP_2026["season"],
-        "count": 500,
-        "language": "en",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0",
-        "Accept": "application/json",
-    }
-
+    """팀별 본선 성적+세부지표 — API-Football 1순위(점유율·유효슈팅·xG 포함), 실패 시 FIFA 폴백."""
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        return handle_error(e, "WorldCup-TeamStats-Fetch")
+        return {"status": "success", "source": "api-football", "data": _worldcup_teamstats_af()}
+    except Exception as e_af:
+        print(f"[WorldCup-TeamStats] API-Football 실패 → FIFA 폴백: {e_af}")
+        try:
+            return {"status": "success", "source": "fifa", "data": _worldcup_teamstats_fifa()}
+        except Exception as e_fifa:
+            return handle_error(e_fifa, "WorldCup-TeamStats")
 
+
+@app.get("/api/worldcup/fixture/{fixture_id}")
+def get_worldcup_fixture(fixture_id: int):
+    """단일 경기 실시간 상세: 스코어/상태 + 매치통계(home/away) + 타임라인 + 라인업. (API-Football)"""
+    cache_key = f"wc_fixture_{fixture_id}"
+    cached = _cache_get(cache_key, ttl=45)  # 라이브 45초 캐시
+    if cached is not None:
+        return cached
     try:
-        results = payload.get("Results") or payload.get("results") or []
+        fx_payload = af_get("/fixtures", {"id": fixture_id})
+        resp = fx_payload.get("response", []) or []
+        if not resp:
+            return {"status": "error", "message": "경기를 찾을 수 없습니다.", "data": None}
+        item = resp[0]
+        fx = item.get("fixture") or {}
+        teams = item.get("teams") or {}
+        goals = item.get("goals") or {}
+        st = fx.get("status") or {}
+        home_name = (teams.get("home") or {}).get("name")
 
-        def team_name(side):
-            try:
-                return side["TeamName"][0]["Description"]
-            except (KeyError, IndexError, TypeError):
-                return None  # 대진 미확정(토너먼트 placeholder)은 집계 제외
+        timeline = []
+        for ev in item.get("events") or []:
+            tm = ev.get("time") or {}
+            timeline.append({
+                "minute": tm.get("elapsed"),
+                "extra": tm.get("extra"),
+                "team": (ev.get("team") or {}).get("name"),
+                "type": ev.get("type"),       # Goal / Card / subst
+                "detail": ev.get("detail"),   # Normal Goal / Yellow Card / ...
+                "player": (ev.get("player") or {}).get("name"),
+                "assist": (ev.get("assist") or {}).get("name"),
+            })
 
-        stats = {}
+        statistics = {"home": {}, "away": {}}
+        try:
+            for side in af_get("/fixtures/statistics", {"fixture": fixture_id}).get("response", []) or []:
+                key = "home" if (side.get("team") or {}).get("name") == home_name else "away"
+                statistics[key] = {it.get("type"): it.get("value") for it in (side.get("statistics") or [])}
+        except Exception as se:
+            print(f"[WorldCup-Fixture] 통계 생략 fixture={fixture_id}: {se}")
 
-        def slot(name):
-            if name not in stats:
-                stats[name] = {"played": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0}
-            return stats[name]
+        lineups = []
+        try:
+            for lu in af_get("/fixtures/lineups", {"fixture": fixture_id}).get("response", []) or []:
+                lineups.append({
+                    "team": (lu.get("team") or {}).get("name"),
+                    "formation": lu.get("formation"),
+                    "startXI": [(p.get("player") or {}).get("name") for p in (lu.get("startXI") or [])],
+                })
+        except Exception as le:
+            print(f"[WorldCup-Fixture] 라인업 생략 fixture={fixture_id}: {le}")
 
-        for m in results:
-            if m.get("MatchStatus") != 0:   # 0 = 경기 종료(결과 확정)
-                continue
-            hn = team_name(m.get("Home") or {})
-            an = team_name(m.get("Away") or {})
-            hs, as_ = m.get("HomeTeamScore"), m.get("AwayTeamScore")
-            if not hn or not an or hs is None or as_ is None:
-                continue
-            try:
-                hs, as_ = int(hs), int(as_)
-            except (ValueError, TypeError):
-                continue
-
-            sh, sa = slot(hn), slot(an)
-            sh["played"] += 1; sa["played"] += 1
-            sh["gf"] += hs; sh["ga"] += as_
-            sa["gf"] += as_; sa["ga"] += hs
-            if hs > as_:
-                sh["w"] += 1; sa["l"] += 1
-            elif hs < as_:
-                sh["l"] += 1; sa["w"] += 1
-            else:
-                sh["d"] += 1; sa["d"] += 1
-
-        data = {}
-        for name, s in stats.items():
-            gp = s["played"] or 1
-            data[name] = {
-                "played": s["played"],
-                "w": s["w"], "d": s["d"], "l": s["l"],
-                "gf": s["gf"], "ga": s["ga"],
-                "avg_gf": round(s["gf"] / gp, 2),
-                "avg_ga": round(s["ga"] / gp, 2),
-                "points": s["w"] * 3 + s["d"],
-            }
-
-        return {"status": "success", "data": data}
+        data = {
+            "match_id": fixture_id,
+            "home": home_name,
+            "away": (teams.get("away") or {}).get("name"),
+            "home_score": goals.get("home"),
+            "away_score": goals.get("away"),
+            "status": st.get("short"),
+            "status_long": st.get("long"),
+            "elapsed": st.get("elapsed"),
+            "timeline": timeline,
+            "statistics": statistics,
+            "lineups": lineups,
+        }
+        return _cache_set(cache_key, {"status": "success", "data": data})
     except Exception as e:
-        return handle_error(e, "WorldCup-TeamStats-Parsing")
+        return handle_error(e, "WorldCup-Fixture")
 
 
 if __name__ == "__main__":
