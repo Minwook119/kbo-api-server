@@ -4,3 +4,4 @@ pandas
 playwright
 lxml
 html5lib
+requests
