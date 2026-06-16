@@ -33,9 +33,14 @@ def handle_error(e: Exception, sport_name: str):
 # API-Football (Pro) — 2026 월드컵 일정/세부지표의 1순위 소스.
 # 키는 환경변수 API_FOOTBALL_KEY 로만 주입(클라이언트 노출 금지). 미설정/오류 시 FIFA 폴백.
 # ──────────────────────────────────────────────────────────────────────────
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "56b655b93ba83e349f606c0e8d70d72a")
 API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
 WORLDCUP_AF = {"league": 1, "season": 2026}  # league 1 = FIFA World Cup
+
+# api-sports 야구 API(NPB 일정 프록시). 동일 계정 키를 football/baseball 이 공유하므로
+# API_SPORTS_KEY 우선, 없으면 기존 API_FOOTBALL_KEY 재사용(키 회전 시 env 1개만 갱신).
+API_SPORTS_KEY = os.getenv("API_SPORTS_KEY") or API_FOOTBALL_KEY
+API_BASEBALL_BASE = "https://v1.baseball.api-sports.io"
 
 # 아주 단순한 인메모리 TTL 캐시(인스턴스 단위). 비싼 집계/라이브 호출 재요청 방지.
 _AF_CACHE: dict[str, tuple[float, object]] = {}
@@ -197,6 +202,47 @@ def get_kbo_schedule():
         return {"status": "success", "data": df.to_dict(orient="records")}
     except Exception as e:
         return handle_error(e, "KBO-Schedule")
+
+
+@app.get("/api/npb/schedule")
+def get_npb_schedule(date: str):
+    """NPB(일본 프로야구) 일정 — api-sports baseball /games 프록시.
+    키는 환경변수(API_SPORTS_KEY/API_FOOTBALL_KEY)에서만 주입하여 클라이언트 노출을 막는다.
+    프런트가 소비하는 필드(home/away)만 추려서 NPB(일본) 경기로 필터링해 반환한다."""
+    try:
+        if not API_SPORTS_KEY:
+            raise RuntimeError("API_SPORTS_KEY/API_FOOTBALL_KEY 미설정")
+        resp = requests.get(
+            f"{API_BASEBALL_BASE}/games",
+            params={"date": date, "timezone": "Asia/Seoul"},
+            headers={"x-apisports-key": API_SPORTS_KEY, "Accept": "application/json"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        errors = payload.get("errors")
+        # api-sports 는 errors 를 {} 또는 [] 로 주며, 비어있지 않으면 실패(쿼터/키 등)
+        if errors and (isinstance(errors, dict) and errors or isinstance(errors, list) and errors):
+            raise RuntimeError(f"api-sports baseball errors: {errors}")
+
+        games = []
+        for g in payload.get("response", []) or []:
+            league = g.get("league") or {}
+            country = g.get("country") or {}
+            lname = str(league.get("name") or "").upper()
+            cname = str(country.get("name") or "").upper()
+            if "NPB" not in lname and "JAPAN" not in cname:
+                continue
+            teams = g.get("teams") or {}
+            games.append({
+                "home": (teams.get("home") or {}).get("name") or "미정",
+                "away": (teams.get("away") or {}).get("name") or "미정",
+                "league": league.get("name"),
+                "country": country.get("name"),
+            })
+        return {"status": "success", "data": games}
+    except Exception as e:
+        return handle_error(e, "NPB-Schedule")
 
 
 # 2026 FIFA 월드컵 식별자 (FIFA 공식 데이터 API 기준: 월드컵=17, 2026 시즌=285023)
