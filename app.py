@@ -195,5 +195,85 @@ def get_worldcup_schedule():
         return handle_error(e, "WorldCup-Parsing")
 
 
+@app.get("/api/worldcup/teamstats")
+def get_worldcup_teamstats():
+    """각 국가대표팀의 2026 월드컵 본선 성적 집계(전적·득실점).
+    FIFA 경기 결과(MatchStatus==0)로부터 직접 계산하므로 일정 엔드포인트와 팀명이 100% 동일."""
+    url = "https://api.fifa.com/api/v3/calendar/matches"
+    params = {
+        "idCompetition": WORLDCUP_2026["competition"],
+        "idSeason": WORLDCUP_2026["season"],
+        "count": 500,
+        "language": "en",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0",
+        "Accept": "application/json",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        return handle_error(e, "WorldCup-TeamStats-Fetch")
+
+    try:
+        results = payload.get("Results") or payload.get("results") or []
+
+        def team_name(side):
+            try:
+                return side["TeamName"][0]["Description"]
+            except (KeyError, IndexError, TypeError):
+                return None  # 대진 미확정(토너먼트 placeholder)은 집계 제외
+
+        stats = {}
+
+        def slot(name):
+            if name not in stats:
+                stats[name] = {"played": 0, "w": 0, "d": 0, "l": 0, "gf": 0, "ga": 0}
+            return stats[name]
+
+        for m in results:
+            if m.get("MatchStatus") != 0:   # 0 = 경기 종료(결과 확정)
+                continue
+            hn = team_name(m.get("Home") or {})
+            an = team_name(m.get("Away") or {})
+            hs, as_ = m.get("HomeTeamScore"), m.get("AwayTeamScore")
+            if not hn or not an or hs is None or as_ is None:
+                continue
+            try:
+                hs, as_ = int(hs), int(as_)
+            except (ValueError, TypeError):
+                continue
+
+            sh, sa = slot(hn), slot(an)
+            sh["played"] += 1; sa["played"] += 1
+            sh["gf"] += hs; sh["ga"] += as_
+            sa["gf"] += as_; sa["ga"] += hs
+            if hs > as_:
+                sh["w"] += 1; sa["l"] += 1
+            elif hs < as_:
+                sh["l"] += 1; sa["w"] += 1
+            else:
+                sh["d"] += 1; sa["d"] += 1
+
+        data = {}
+        for name, s in stats.items():
+            gp = s["played"] or 1
+            data[name] = {
+                "played": s["played"],
+                "w": s["w"], "d": s["d"], "l": s["l"],
+                "gf": s["gf"], "ga": s["ga"],
+                "avg_gf": round(s["gf"] / gp, 2),
+                "avg_ga": round(s["ga"] / gp, 2),
+                "points": s["w"] * 3 + s["d"],
+            }
+
+        return {"status": "success", "data": data}
+    except Exception as e:
+        return handle_error(e, "WorldCup-TeamStats-Parsing")
+
+
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
