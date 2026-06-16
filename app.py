@@ -1,4 +1,5 @@
 import io
+import requests
 import uvicorn
 import pandas as pd
 from fastapi import FastAPI
@@ -127,6 +128,71 @@ def get_kbo_schedule():
         return {"status": "success", "data": df.to_dict(orient="records")}
     except Exception as e:
         return handle_error(e, "KBO-Schedule")
+
+
+# 2026 FIFA 월드컵 식별자 (FIFA 공식 데이터 API 기준: 월드컵=17, 2026 시즌=285023)
+WORLDCUP_2026 = {"competition": "17", "season": "285023"}
+
+
+@app.get("/api/worldcup/schedule")
+def get_worldcup_schedule():
+    """2026 FIFA 월드컵 경기 일정 (FIFA 공식 데이터 API v3 사용 - FIFA SPA가 내부적으로 쓰는 공식 소스라 가장 안정적)"""
+    url = "https://api.fifa.com/api/v3/calendar/matches"
+    params = {
+        "idCompetition": WORLDCUP_2026["competition"],
+        "idSeason": WORLDCUP_2026["season"],
+        "count": 500,
+        "language": "en",
+    }
+    # 봇 차단 회피용 브라우저 User-Agent
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0",
+        "Accept": "application/json",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        return handle_error(e, "WorldCup-Fetch")
+
+    try:
+        results = payload.get("Results") or payload.get("results") or []
+
+        def localized(node):
+            # FIFA는 다국어 배열 형태([{Locale, Description}, ...])로 내려줌
+            try:
+                return node[0]["Description"]
+            except (KeyError, IndexError, TypeError):
+                return ""
+
+        def team_name(side):
+            try:
+                return side["TeamName"][0]["Description"]
+            except (KeyError, IndexError, TypeError):
+                return "미정"  # 토너먼트 등 대진 미확정 경기 방어
+
+        games = []
+        for m in results:
+            home = m.get("Home") or {}
+            away = m.get("Away") or {}
+            stadium = m.get("Stadium") or {}
+            games.append({
+                "date": m.get("Date"),                  # UTC ISO (예: 2026-06-11T19:00:00Z)
+                "home": team_name(home),
+                "away": team_name(away),
+                "group": localized(m.get("GroupName")),  # 예: Group A (없으면 빈 문자열)
+                "stage": localized(m.get("StageName")),  # 예: First Stage / Round of 32 ...
+                "stadium": localized(stadium.get("Name")),
+                "status": m.get("MatchStatus"),
+                "home_score": home.get("Score"),
+                "away_score": away.get("Score"),
+            })
+
+        return {"status": "success", "data": games}
+    except Exception as e:
+        return handle_error(e, "WorldCup-Parsing")
 
 
 if __name__ == "__main__":
