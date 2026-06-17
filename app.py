@@ -390,25 +390,34 @@ def _worldcup_teamstats_af() -> dict:
         fixtures = []
 
     agg: dict = {}  # name -> 누적 {합계, 개수}
+    finished = {"FT", "AET", "PEN"}  # 정규시간/연장/승부차기 종료 — 녹아웃 경기도 집계에 포함
     for g in fixtures:
-        if g.get("status") != "FT" or not g.get("match_id"):
+        if g.get("status") not in finished or not g.get("match_id"):
             continue
-        try:
-            stat_payload = af_get("/fixtures/statistics", {"fixture": g["match_id"]})
-        except Exception:
+        mid = g["match_id"]
+        # 종료 경기의 통계는 더 이상 바뀌지 않으므로 경기 단위로 길게 캐시(24h) → 리빌드 시 API 재호출 최소화
+        fxkey = f"wc_fxstat_{mid}"
+        parsed = _cache_get(fxkey, ttl=24 * 3600)
+        if parsed is None:
+            try:
+                stat_payload = af_get("/fixtures/statistics", {"fixture": mid})
+            except Exception:
+                continue
+            sides = stat_payload.get("response", []) or []
+            if len(sides) < 2:
+                continue
+            parsed = []
+            for side in sides:
+                items = side.get("statistics") or []
+                parsed.append({
+                    "name": (side.get("team") or {}).get("name"),
+                    "pos": _pct_to_number(_af_stat_value(items, "Ball Possession")),
+                    "sot": _pct_to_number(_af_stat_value(items, "Shots on Goal")),
+                    "xg": _pct_to_number(_af_stat_value(items, "expected_goals")),
+                })
+            _cache_set(fxkey, parsed)
+        if len(parsed) < 2:
             continue
-        sides = stat_payload.get("response", []) or []
-        if len(sides) < 2:
-            continue
-        parsed = []
-        for side in sides:
-            items = side.get("statistics") or []
-            parsed.append({
-                "name": (side.get("team") or {}).get("name"),
-                "pos": _pct_to_number(_af_stat_value(items, "Ball Possession")),
-                "sot": _pct_to_number(_af_stat_value(items, "Shots on Goal")),
-                "xg": _pct_to_number(_af_stat_value(items, "expected_goals")),
-            })
         for i, p in enumerate(parsed):
             name = p["name"]
             if not name:
@@ -680,6 +689,163 @@ def get_worldcup_lineup_strength(fixture_id: int):
         return {"status": "success", "data": _worldcup_lineup_strength(fixture_id)}
     except Exception as e:
         return handle_error(e, "WorldCup-LineupStrength")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 배구 — FIVB 네이션스리그(VNL, 남/여). api-sports volleyball API 프록시.
+# 동일 api-sports 계정 키 사용(API_SPORTS_KEY→API_FOOTBALL_KEY). 배구 별도 구독이 필요할 수 있음.
+# 주의: api-sports 배구는 일정/세트스코어/순위 중심 — 세부 스킬스탯은 제공하지 않음.
+# ──────────────────────────────────────────────────────────────────────────
+VOLLEYBALL_BASE = "https://v1.volleyball.api-sports.io"
+VNL_SEASON = int(os.getenv("VNL_SEASON", "2026"))
+
+
+def vb_get(path: str, params: dict | None = None, timeout: int = 20) -> dict:
+    """api-sports volleyball GET. 키 미설정/오류 시 예외."""
+    if not API_SPORTS_KEY:
+        raise RuntimeError("API_SPORTS_KEY/API_FOOTBALL_KEY 미설정")
+    resp = requests.get(
+        f"{VOLLEYBALL_BASE}{path}",
+        params=params or {},
+        headers={"x-apisports-key": API_SPORTS_KEY, "Accept": "application/json"},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    errors = payload.get("errors")
+    if errors and (isinstance(errors, dict) and errors or isinstance(errors, list) and errors):
+        raise RuntimeError(f"api-sports volleyball errors: {errors}")
+    return payload
+
+
+def _is_vnl(name) -> bool:
+    return "nations league" in str(name or "").lower()
+
+
+def _vnl_gender(name) -> str:
+    n = str(name or "").lower()
+    if "women" in n:
+        return "여자"
+    if "men" in n:
+        return "남자"
+    return ""
+
+
+def _vb_sets(game: dict):
+    """경기에서 (홈 세트, 원정 세트) 추출 — 제공처 필드명이 scores/goals 중 무엇이든 방어적으로 처리."""
+    for key in ("scores", "goals"):
+        node = game.get(key) or {}
+        h, a = node.get("home"), node.get("away")
+        if h is not None and a is not None:
+            return h, a
+    return None, None
+
+
+@app.get("/api/volleyball/schedule")
+def get_volleyball_schedule(date: str):
+    """VNL(남/여) 일정 — api-sports volleyball /games?date= 에서 'Nations League'만 필터해 반환."""
+    try:
+        payload = vb_get("/games", {"date": date, "timezone": "Asia/Seoul"})
+        games = []
+        for g in payload.get("response", []) or []:
+            league = g.get("league") or {}
+            if not _is_vnl(league.get("name")):
+                continue
+            teams = g.get("teams") or {}
+            status = g.get("status") or {}
+            hs, as_ = _vb_sets(g)
+            games.append({
+                "match_id": g.get("id"),
+                "date": g.get("date"),
+                "home": (teams.get("home") or {}).get("name"),
+                "away": (teams.get("away") or {}).get("name"),
+                "home_sets": hs,
+                "away_sets": as_,
+                "status": status.get("short") or status.get("long"),
+                "league": league.get("name"),
+                "gender": _vnl_gender(league.get("name")),
+            })
+        return {"status": "success", "data": games}
+    except Exception as e:
+        return handle_error(e, "Volleyball-Schedule")
+
+
+def _vnl_leagues() -> list:
+    """VNL(남/여) league id 목록을 /leagues 검색으로 동적 확보(하드코딩 회피). 24h 캐시."""
+    cached = _cache_get("vnl_leagues", ttl=24 * 3600)
+    if cached is not None:
+        return cached
+    out = []
+    try:
+        payload = vb_get("/leagues", {"search": "Nations League"})
+        for it in payload.get("response", []) or []:
+            lg = it.get("league") or it  # 구조 방어(중첩/평면 모두 대응)
+            name = lg.get("name") or it.get("name")
+            lid = lg.get("id") or it.get("id")
+            if _is_vnl(name) and lid is not None:
+                out.append({"id": lid, "name": name})
+    except Exception as e:
+        print(f"[Volleyball] VNL 리그 검색 실패: {e}")
+    return _cache_set("vnl_leagues", out)
+
+
+@app.get("/api/volleyball/teamstats")
+def get_volleyball_teamstats():
+    """VNL 팀별 전적/세트 집계 — 경기 결과(/games?league=&season=)로부터 직접 계산(팀명 키 dict).
+    일정과 동일 소스라 팀명이 100% 일치. 세부 스킬스탯은 api-sports 미제공 → 프런트에서 수동 입력."""
+    cache_key = "vnl_teamstats"
+    cached = _cache_get(cache_key, ttl=3 * 3600)
+    if cached is not None:
+        return {"status": "success", "data": cached}
+    try:
+        agg: dict = {}
+
+        def slot(name):
+            if name not in agg:
+                agg[name] = {"played": 0, "w": 0, "l": 0, "sets_won": 0, "sets_lost": 0}
+            return agg[name]
+
+        leagues = _vnl_leagues()
+        for lg in leagues:
+            try:
+                payload = vb_get("/games", {"league": lg["id"], "season": VNL_SEASON})
+            except Exception:
+                continue
+            for g in payload.get("response", []) or []:
+                teams = g.get("teams") or {}
+                hn = (teams.get("home") or {}).get("name")
+                an = (teams.get("away") or {}).get("name")
+                hs, as_ = _vb_sets(g)
+                if not hn or not an or hs is None or as_ is None:
+                    continue
+                try:
+                    hs, as_ = int(hs), int(as_)
+                except (ValueError, TypeError):
+                    continue
+                if hs == as_:  # 미완료/무효(배구는 무승부 없음)
+                    continue
+                sh, sa = slot(hn), slot(an)
+                sh["played"] += 1; sa["played"] += 1
+                sh["sets_won"] += hs; sh["sets_lost"] += as_
+                sa["sets_won"] += as_; sa["sets_lost"] += hs
+                if hs > as_:
+                    sh["w"] += 1; sa["l"] += 1
+                else:
+                    sh["l"] += 1; sa["w"] += 1
+
+        data = {}
+        for name, s in agg.items():
+            sw, sl = s["sets_won"], s["sets_lost"]
+            data[name] = {
+                "played": s["played"], "w": s["w"], "l": s["l"],
+                "sets_won": sw, "sets_lost": sl,
+                "set_ratio": round(sw / (sw + sl), 3) if (sw + sl) > 0 else None,
+                "win_rate": round(s["w"] / s["played"], 3) if s["played"] > 0 else None,
+            }
+        _cache_set(cache_key, data)
+        return {"status": "success", "data": data}
+    except Exception as e:
+        return handle_error(e, "Volleyball-TeamStats")
 
 
 if __name__ == "__main__":
