@@ -593,5 +593,94 @@ def get_worldcup_fixture(fixture_id: int):
         return handle_error(e, "WorldCup-Fixture")
 
 
+def _wc_player_ratings_for_team(team_id) -> dict:
+    """대회(league=1, season=2026) 시즌 선수별 평균 평점 {player_id: rating}. 페이지네이션 처리."""
+    ratings: dict = {}
+    page = 1
+    while True:
+        payload = af_get("/players", {
+            "team": team_id, "league": WORLDCUP_AF["league"], "season": WORLDCUP_AF["season"], "page": page,
+        })
+        for it in payload.get("response", []) or []:
+            pid = (it.get("player") or {}).get("id")
+            if pid is None:
+                continue
+            r = None
+            for s in it.get("statistics", []) or []:
+                rating = _pct_to_number((s.get("games") or {}).get("rating"))
+                if rating is None:
+                    continue
+                if ((s.get("league") or {}).get("id")) == WORLDCUP_AF["league"]:
+                    r = rating  # 월드컵 평점 우선
+                    break
+                if r is None:
+                    r = rating  # 폴백: 첫 유효 평점
+            if r is not None:
+                ratings[pid] = r
+        paging = payload.get("paging") or {}
+        if page >= (paging.get("total") or 1):
+            break
+        page += 1
+    return ratings
+
+
+def _worldcup_lineup_strength(fixture_id: int) -> dict:
+    """선발 XI 평균 평점을 팀명 키 dict 로 반환: {teamName: {rating, count, formation}}.
+    1) 라인업(startXI) 확보 → 2) 경기 선수평점(fixtures/players)이 있으면 그 선발 평점 평균,
+    없으면 대회 시즌 선수 평균평점으로 startXI 매핑. 데이터 없으면 rating=None(프런트는 등급표 폴백)."""
+    cache_key = f"wc_lineupstrength_{fixture_id}"
+    cached = _cache_get(cache_key, ttl=600)  # 10분 캐시
+    if cached is not None:
+        return cached
+
+    lineups = af_get("/fixtures/lineups", {"fixture": fixture_id}).get("response", []) or []
+
+    # (있으면) 경기 선수평점에서 '선발(substitute=False)' 평균
+    fx_team_rating: dict = {}
+    try:
+        for side in af_get("/fixtures/players", {"fixture": fixture_id}).get("response", []) or []:
+            tid = (side.get("team") or {}).get("id")
+            vals = []
+            for p in side.get("players", []) or []:
+                g = ((p.get("statistics") or [{}])[0] or {}).get("games") or {}
+                if g.get("substitute") is False:
+                    rr = _pct_to_number(g.get("rating"))
+                    if rr is not None:
+                        vals.append(rr)
+            if vals:
+                fx_team_rating[tid] = sum(vals) / len(vals)
+    except Exception as pe:
+        print(f"[WorldCup-LineupStrength] fixtures/players 생략 fixture={fixture_id}: {pe}")
+
+    data: dict = {}
+    for side in lineups:
+        team = side.get("team") or {}
+        tid, tname = team.get("id"), team.get("name")
+        if not tname:
+            continue
+        rating, count = None, 0
+        startxi_ids = [(e.get("player") or {}).get("id") for e in (side.get("startXI") or [])]
+        if tid in fx_team_rating:
+            rating = round(fx_team_rating[tid], 2)
+            count = len(startxi_ids) or 11
+        elif startxi_ids:
+            tr = _wc_player_ratings_for_team(tid)
+            vals = [tr[i] for i in startxi_ids if i in tr]
+            if vals:
+                rating = round(sum(vals) / len(vals), 2)
+                count = len(vals)
+        data[tname] = {"rating": rating, "count": count, "formation": side.get("formation")}
+    return _cache_set(cache_key, data)
+
+
+@app.get("/api/worldcup/lineup-strength/{fixture_id}")
+def get_worldcup_lineup_strength(fixture_id: int):
+    """선택 경기의 실제 선발 XI 평균 평점(라인업 전력 보정용). API-Football 전용 — 데이터 없으면 빈 값."""
+    try:
+        return {"status": "success", "data": _worldcup_lineup_strength(fixture_id)}
+    except Exception as e:
+        return handle_error(e, "WorldCup-LineupStrength")
+
+
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
